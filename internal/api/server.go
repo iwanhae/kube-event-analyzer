@@ -26,6 +26,7 @@ func New(storage *storage.Storage, port string) *Server {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/query", s.handleQuery)
+	mux.HandleFunc("/health", s.handleHealth)
 
 	s.server = &http.Server{
 		Addr:    ":" + port,
@@ -92,6 +93,21 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Failed to write response: %v", err)
 	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Simple health check - could be enhanced to check database connectivity
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 func serializeRows(rows *sql.Rows) ([]map[string]any, error) {
