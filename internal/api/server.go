@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/iwanhae/kube-event-analyzer/internal/storage"
@@ -17,14 +18,16 @@ import (
 
 // Server holds the dependencies for the API server.
 type Server struct {
-	storage *storage.Storage
-	server  *http.Server
+	reader *storage.Reader
+	writer *storage.Writer
+	server *http.Server
 }
 
 // New creates a new API server.
-func New(storage *storage.Storage, port string, distFS embed.FS) *Server {
+func New(reader *storage.Reader, writer *storage.Writer, port string, distFS embed.FS) *Server {
 	s := &Server{
-		storage: storage,
+		reader: reader,
+		writer: writer,
 	}
 
 	mux := http.NewServeMux()
@@ -63,8 +66,13 @@ func New(storage *storage.Storage, port string, distFS embed.FS) *Server {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if s.writer == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Stats are only available in writer or all-in-one mode"})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(s.storage.Stats())
+	json.NewEncoder(w).Encode(s.writer.Stats())
 }
 
 // Start runs the API server.
@@ -86,10 +94,10 @@ type queryRequest struct {
 }
 
 type queryResponse struct {
-	Results        []map[string]any          `json:"results"`
-	DurationMs     int64                     `json:"duration_ms"`
-	Files          []storage.ParquetFileInfo `json:"files"`
-	TotalFilesSize int64                     `json:"total_files_size_bytes"`
+	Results        []map[string]any `json:"results"`
+	DurationMs     int64            `json:"duration_ms"`
+	Files          []string         `json:"files"`
+	TotalFilesSize int64            `json:"total_files_size_bytes"`
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +117,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, result, err := s.storage.RangeQuery(r.Context(), req.Query, req.Start, req.End)
+	rows, result, err := s.reader.RangeQuery(r.Context(), req.Query, req.Start, req.End)
 	if err != nil {
 		log.Printf("server: failed to execute query: %v", err)
 		http.Error(w, fmt.Sprintf("server: failed to execute query: %v", err), http.StatusInternalServerError)
@@ -125,7 +133,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	var totalSize int64
 	for _, f := range result.Files {
-		totalSize += f.Size
+		info, err := os.Stat(f)
+		if err == nil {
+			totalSize += info.Size()
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"embed"
+	"flag"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/iwanhae/kube-event-analyzer/internal/api"
 	"github.com/iwanhae/kube-event-analyzer/internal/collector"
@@ -20,6 +22,9 @@ import (
 var distFS embed.FS
 
 func main() {
+	role := flag.String("role", "all", "service role: all, writer, or reader")
+	flag.Parse()
+
 	cfg := config.Load()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -30,26 +35,100 @@ func main() {
 	signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-stopCh
-		log.Println("main: received shutdown signal, initiating graceful shutdown...")
+		log.Printf("main: received shutdown signal for role=%s, initiating graceful shutdown...", *role)
 		cancel()
 	}()
 
-	// --- Storage ---
-	storage, err := storage.New(ctx, "data/events.db")
-	if err != nil {
-		log.Fatalf("main: failed to initialize storage: %v", err)
+	log.Printf("main: starting service with role: %s", *role)
+
+	switch *role {
+	case "writer":
+		runWriter(ctx, &wg, cfg)
+	case "reader":
+		runReader(ctx, &wg, cfg)
+	case "all":
+		runAllInOne(ctx, &wg, cfg)
+	default:
+		log.Fatalf("main: unknown role: %s", *role)
 	}
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+
+	log.Println("main: waiting for all background processes to finish...")
+	wg.Wait()
+	log.Println("main: all processes finished. exiting.")
+}
+
+func runWriter(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config) {
+	writer, err := storage.NewWriter(cfg.DBPath, cfg.ParquetPath)
+	if err != nil {
+		log.Fatalf("writer: failed to initialize storage writer: %v", err)
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-ctx.Done()
-		log.Println("main: shutting down storage...")
-		storage.Wait()
-		log.Println("main: storage closed")
+		log.Println("writer: starting data lifecycle manager...")
+		writer.LifecycleManager(ctx, cfg.ArchiveInterval, cfg.StorageLimitBytes)
+		log.Println("writer: data lifecycle manager finished")
+		log.Println("writer: closing writer...")
+		writer.Close()
+		log.Println("writer: writer closed")
 	}()
 
-	// --- API Server ---
-	apiServer := api.New(storage, cfg.ListenPort, distFS)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println("writer: starting event collector...")
+		runCollector(ctx, writer)
+		log.Println("writer: collector finished")
+	}()
+}
+
+func runReader(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config) {
+	reader, err := storage.NewReader(cfg.DBPath, cfg.ParquetPath)
+	if err != nil {
+		log.Fatalf("reader: failed to initialize storage reader: %v", err)
+	}
+
+	// The API server only needs a reader in this mode.
+	apiServer := api.New(reader, nil, cfg.ListenPort, distFS)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		log.Printf("reader: starting API server on port %s...", cfg.ListenPort)
+		if err := apiServer.Start(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("reader: API server failed: %v", err)
+		}
+		log.Println("reader: API server closed")
+		log.Println("reader: closing reader...")
+		reader.Close()
+		log.Println("reader: reader closed")
+	}()
+
+	// Graceful shutdown for the API server
+	<-ctx.Done()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("reader: error during API server shutdown: %v", err)
+	}
+}
+
+func runAllInOne(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config) {
+	writer, err := storage.NewWriter(cfg.DBPath, cfg.ParquetPath)
+	if err != nil {
+		log.Fatalf("main: failed to initialize storage writer: %v", err)
+	}
+
+	reader, err := storage.NewReader(cfg.DBPath, cfg.ParquetPath)
+	if err != nil {
+		log.Fatalf("main: failed to initialize storage reader: %v", err)
+	}
+
+	apiServer := api.New(reader, writer, cfg.ListenPort, distFS)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -60,37 +139,38 @@ func main() {
 		log.Println("main: API server closed")
 	}()
 
-	// --- Collector and Data Lifecycle ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		log.Println("main: starting data lifecycle manager...")
-		storage.LifecycleManager(ctx, cfg.ArchiveInterval, cfg.StorageLimitBytes)
+		writer.LifecycleManager(ctx, cfg.ArchiveInterval, cfg.StorageLimitBytes)
 		log.Println("main: data lifecycle manager finished")
+		log.Println("main: closing writer...")
+		writer.Close()
+		log.Println("main: writer closed")
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		log.Println("main: starting event collector...")
-		runCollector(ctx, storage)
+		runCollector(ctx, writer)
 		log.Println("main: collector finished")
 	}()
 
-	// Wait for shutdown signal
+	// Graceful shutdown for the API server
 	<-ctx.Done()
-
-	// --- Graceful Shutdown ---
-	if err := apiServer.Shutdown(context.Background()); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("main: error during API server shutdown: %v", err)
 	}
-
-	log.Println("main: waiting for all background processes to finish...")
-	wg.Wait()
-	log.Println("main: all processes finished. exiting.")
+	log.Println("main: closing reader...")
+	reader.Close()
+	log.Println("main: reader closed")
 }
 
-func runCollector(ctx context.Context, storage *storage.Storage) {
+func runCollector(ctx context.Context, writer *storage.Writer) {
 	c, err := collector.ConnectK8s()
 	if err != nil {
 		log.Printf("collector: error connecting to Kubernetes: %v. collector will not run.", err)
@@ -119,7 +199,7 @@ func runCollector(ctx context.Context, storage *storage.Storage) {
 				event.Count = 1
 			}
 
-			if err := storage.AppendEvent(ctx, &event); err != nil {
+			if err := writer.AppendEvent(&event); err != nil {
 				log.Printf("collector: failed to append event: %v", err)
 			}
 		case <-ctx.Done():
